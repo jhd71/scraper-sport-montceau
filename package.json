@@ -1,0 +1,12 @@
+{
+  "name": "scraper-sport-montceau",
+  "version": "1.0.0",
+  "description": "Scraper FC Montceau Bourgogne - SportCorico + FFF",
+  "main": "update-sport.js",
+  "scripts": {
+    "start": "node update-sport.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0"
+  }
+}
