@@ -14,6 +14,7 @@ const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const SPORTCORICO_URL = 'https://www.sportcorico.com/clubs/fc-montceau-bourgogne/montceau-fc-bourgogn';
 const FFF_CLASSEMENT_URL = 'https://epreuves.fff.fr/competition/engagement/438243-regional-1-herbelin/phase/1/1/classement';
+const POULE_URL = 'https://www.sportcorico.com/championnat/bourgogne-franche-comte-regional-1-herbelin-4/phase-unique/poule-a';
 const COMPETITION = 'REGIONAL 1 HERBELIN';
 
 // ============================================
@@ -102,6 +103,48 @@ function parseHeaderMatches(text) {
     }
 
     return result;
+}
+
+// ============================================
+// SECOURS : PROCHAIN MATCH DEPUIS LA PAGE DE LA POULE
+// Utilisé quand la fiche du club n'affiche pas de match R1
+// (intersaison : elle ne montre que des amicaux)
+// ============================================
+async function parseProchainDepuisPoule() {
+    const html = await fetchHTML(POULE_URL);
+    const text = htmlToText(html);
+
+    const aujourdhui = new Intl.DateTimeFormat('fr-CA', {
+        timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(new Date());
+
+    const regex = /([\w\s'.()-]+?\d)\s+(\d{2}\/\d{2}\/\d{4})\s+(\d{2}:\d{2})\s+([\w\s'.()-]+?\d)/g;
+    let m, meilleur = null;
+
+    while ((m = regex.exec(text)) !== null) {
+        const [, team1, dateStr, time, team2] = m;
+        const t1 = team1.trim();
+        const t2 = team2.trim();
+
+        if (!t1.toLowerCase().includes('montceau') && !t2.toLowerCase().includes('montceau')) continue;
+
+        const [day, month, year] = dateStr.split('/');
+        const date = `${year}-${month}-${day}`;
+
+        if (date < aujourdhui) continue;           // match déjà passé
+        if (meilleur && meilleur.date <= date) continue; // on garde le plus proche
+
+        const isHome = t1.toLowerCase().includes('montceau');
+        meilleur = {
+            date: date,
+            time: time,
+            homeTeam: isHome ? 'FC Montceau' : t1.replace(/\s*\d+$/, '').trim(),
+            awayTeam: isHome ? t2.replace(/\s*\d+$/, '').trim() : 'FC Montceau',
+            isHome: isHome,
+        };
+    }
+
+    return meilleur;
 }
 
 // ============================================
@@ -355,7 +398,22 @@ async function main() {
             updateData.next_match_is_home = nextMatch.isHome;
             logs.push(`✅ Prochain match: ${nextMatch.homeTeam} vs ${nextMatch.awayTeam} le ${nextMatch.date} à ${nextMatch.time}`);
         } else {
-            logs.push('⚠️ Prochain match non trouvé');
+            logs.push('⚠️ Prochain match absent de la fiche club');
+            try {
+                const secours = await parseProchainDepuisPoule();
+                if (secours) {
+                    updateData.next_match_date = secours.date;
+                    updateData.next_match_time = secours.time;
+                    updateData.next_match_home_team = secours.homeTeam;
+                    updateData.next_match_away_team = secours.awayTeam;
+                    updateData.next_match_is_home = secours.isHome;
+                    logs.push(`✅ Prochain match (poule): ${secours.homeTeam} vs ${secours.awayTeam} le ${secours.date} à ${secours.time}`);
+                } else {
+                    logs.push('⚠️ Aucun match à venir dans la poule non plus');
+                }
+            } catch (e) {
+                logs.push('⚠️ Poule: erreur ' + e.message);
+            }
         }
 
         // 4. TOUS LES RÉSULTATS CHAMPIONNAT
