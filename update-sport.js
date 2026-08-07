@@ -407,6 +407,7 @@ async function main() {
                     updateData.next_match_home_team = secours.homeTeam;
                     updateData.next_match_away_team = secours.awayTeam;
                     updateData.next_match_is_home = secours.isHome;
+					updateData.next_match_matchday = 'Journée 1';
                     logs.push(`✅ Prochain match (poule): ${secours.homeTeam} vs ${secours.awayTeam} le ${secours.date} à ${secours.time}`);
                 } else {
                     logs.push('⚠️ Aucun match à venir dans la poule non plus');
