@@ -1,5 +1,5 @@
 // update-sport.js - Script GitHub Actions pour FC Montceau Bourgogne
-// Source: SportCorico + FFF
+// Source: SportCorico
 const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
@@ -13,7 +13,6 @@ if (!SUPABASE_URL || !SUPABASE_KEY) {
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY);
 
 const SPORTCORICO_URL = 'https://www.sportcorico.com/clubs/fc-montceau-bourgogne/montceau-fc-bourgogn';
-const FFF_CLASSEMENT_URL = 'https://epreuves.fff.fr/competition/engagement/438243-regional-1-herbelin/phase/1/1/classement';
 const POULE_URL = 'https://www.sportcorico.com/championnat/bourgogne-franche-comte-regional-1-herbelin-4/phase-unique/poule-a';
 const COMPETITION = 'REGIONAL 1 HERBELIN';
 
@@ -217,120 +216,6 @@ function computeFormFromResults(results) {
 }
 
 // ============================================
-// PARSER CLASSEMENT FFF
-// ============================================
-async function fetchFFFStandings() {
-    try {
-        console.log('📊 Récupération classement FFF...');
-        const html = await fetchHTML(FFF_CLASSEMENT_URL);
-        console.log('📊 Page FFF récupérée:', html.length, 'chars');
-        const standings = [];
-
-        // METHODE 1: Parser les balises <td> du tableau HTML
-        const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi;
-        let trMatch;
-        while ((trMatch = trRegex.exec(html)) !== null) {
-            const row = trMatch[1];
-            const cells = [];
-            const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi;
-            let tdMatch;
-            while ((tdMatch = tdRegex.exec(row)) !== null) {
-                cells.push(tdMatch[1].replace(/<[^>]+>/g, '').trim());
-            }
-            if (cells.length >= 13 && /^\d{1,2}$/.test(cells[0])) {
-                const teamName = cells[2].replace(/^undefined\s*/i, '').trim();
-                if (teamName && !isNaN(parseInt(cells[3]))) {
-                    standings.push({
-                        position: parseInt(cells[0]),
-                        team: teamName,
-                        points: parseInt(cells[3]) || 0,
-                        played: parseInt(cells[4]) || 0,
-                        won: parseInt(cells[5]) || 0,
-                        drawn: parseInt(cells[6]) || 0,
-                        lost: parseInt(cells[7]) || 0,
-                        goalsFor: parseInt(cells[10]) || 0,
-                        goalsAgainst: parseInt(cells[11]) || 0,
-                        diff: parseInt(cells[12]) || 0,
-                    });
-                }
-            }
-        }
-
-        if (standings.length >= 10) {
-            console.log(`✅ Classement FFF HTML: ${standings.length} équipes`);
-            return standings;
-        }
-
-        // METHODE 2: Parser le texte nettoyé
-        const text = htmlToText(html);
-        const lines = text.split('\n');
-        let inTable = false;
-        standings.length = 0;
-
-        for (const line of lines) {
-            if ((line.includes('Equipe') || line.includes('Équipe')) && line.includes('Pts') && (line.includes('Bp') || line.includes('G'))) {
-                inTable = true;
-                continue;
-            }
-            if (inTable) {
-                const cleaned = line.replace(/undefined\s*/g, '').trim();
-                const rowMatch = cleaned.match(/^(\d{1,2})\s+(?:\d*\s+)?([\w\s'.()éèêëàâäôùûüç,/-]+?)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+\d+\s+\d+\s+(\d+)\s+(\d+)\s+(-?\d+)/i);
-                if (rowMatch) {
-                    standings.push({
-                        position: parseInt(rowMatch[1]),
-                        team: rowMatch[2].trim(),
-                        points: parseInt(rowMatch[3]),
-                        played: parseInt(rowMatch[4]),
-                        won: parseInt(rowMatch[5]),
-                        drawn: parseInt(rowMatch[6]),
-                        lost: parseInt(rowMatch[7]),
-                        goalsFor: parseInt(rowMatch[8]),
-                        goalsAgainst: parseInt(rowMatch[9]),
-                        diff: parseInt(rowMatch[10]),
-                    });
-                }
-                if (standings.length > 0 && (cleaned === '' || line.includes('Saison') || line.includes('Semaine'))) break;
-            }
-        }
-
-        if (standings.length >= 10) {
-            console.log(`✅ Classement FFF texte: ${standings.length} équipes`);
-            return standings;
-        }
-
-        // METHODE 3: Regex markdown
-        const mdRegex = /\|\s*(\d{1,2})\s*\|[^|]*\|[^|]*?((?:undefined\s+)?[A-ZÉÈÊËÀÂÄÔÙÛÜÇ][A-ZÉÈÊËÀÂÄÔÙÛÜÇ\s'.()0-9-]+?)\s*(?:\]\([^)]+\))?\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*\d+\s*\|\s*\d+\s*\|\s*(\d+)\s*\|\s*(\d+)\s*\|\s*(-?\d+)\s*\|/g;
-        standings.length = 0;
-        while ((m = mdRegex.exec(html)) !== null) {
-            const teamName = m[2].replace(/^undefined\s*/i, '').trim();
-            standings.push({
-                position: parseInt(m[1]),
-                team: teamName,
-                points: parseInt(m[3]),
-                played: parseInt(m[4]),
-                won: parseInt(m[5]),
-                drawn: parseInt(m[6]),
-                lost: parseInt(m[7]),
-                goalsFor: parseInt(m[8]),
-                goalsAgainst: parseInt(m[9]),
-                diff: parseInt(m[10]),
-            });
-        }
-
-        if (standings.length > 0) {
-            console.log(`✅ Classement FFF markdown: ${standings.length} équipes`);
-            return standings;
-        }
-
-        console.warn('⚠️ Classement FFF: aucune donnée trouvée');
-        return [];
-    } catch (err) {
-        console.warn('⚠️ Classement FFF non disponible:', err.message);
-        return [];
-    }
-}
-
-// ============================================
 // MISE À JOUR SUPABASE
 // ============================================
 async function updateSupabase(data) {
@@ -450,23 +335,7 @@ async function main() {
             }
         }
 
-        // 5. CLASSEMENT FFF
-        try {
-            const standings = await fetchFFFStandings();
-            if (standings.length > 0) {
-                updateData.standings_json = standings;
-                const montceau = standings.find(s => s.team.toLowerCase().includes('montceau'));
-                if (montceau) {
-                    updateData.standing_position = montceau.position;
-                    logs.push(`✅ Position FFF: ${montceau.position}e (${standings.length} équipes)`);
-                }
-                logs.push(`✅ Classement complet: ${standings.length} équipes`);
-            }
-        } catch (e) {
-            logs.push('⚠️ Classement FFF: erreur ' + e.message);
-        }
-
-        // 6. SUPABASE
+        // 5. SUPABASE
         if (Object.keys(updateData).length > 0) {
             const action = await updateSupabase(updateData);
             logs.push(`✅ Supabase ${action} (${Object.keys(updateData).length} champs)`);
