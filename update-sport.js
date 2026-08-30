@@ -33,6 +33,7 @@ const FFF_CLUB_SLUG = '500335-f-c-montceau-bourgogne';
 const FFF_TEAM_ID = saisonFFF() + '_432_SEM_1'; // ex: 2026_432_SEM_1
 const FFF_SITE = 'https://epreuves.fff.fr';
 const FFF_PAGE_URL = FFF_SITE + '/competition/club/' + FFF_CLUB_SLUG + '/equipe/' + FFF_TEAM_ID + '/resultat-calendrier';
+const FFF_CLASSEMENT_PAGE_URL = FFF_SITE + '/competition/club/' + FFF_CLUB_SLUG + '/equipe/' + FFF_TEAM_ID + '/classement';
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -482,25 +483,104 @@ function dateParamFFF(d) {
     return d.toISOString().slice(0, 10) + 'T00:00:00%2B00:00';
 }
 
+// ============================================
+// PLAN B FFF : lire les données incluses dans le HTML des pages.
+// L'API directe est bloquée depuis GitHub Actions (403), mais les pages
+// HTML, elles, se téléchargent sans problème — et elles contiennent un
+// bloc <script id="ng-state"> avec les réponses API déjà incluses.
+// Particularité : chaque lecture de la page matchs n'inclut AU HASARD
+// qu'un seul des deux mois pré-chargés (mois en cours / mois suivant),
+// donc on lit la page plusieurs fois et on fusionne les matchs.
+// ============================================
+
+function extraireNgState(html) {
+    const m = html.match(/<script id="ng-state" type="application\/json">([\s\S]*?)<\/script>/);
+    if (!m) return null;
+    try { return JSON.parse(m[1]); } catch (e) { return null; }
+}
+
+async function fffPageHtml(url) {
+    const res = await fetch(url, {
+        headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    return res.text();
+}
+
+async function fffDepuisPages(essais) {
+    const parId = new Map();
+
+    for (let i = 0; i < essais; i++) {
+        try {
+            // ?v=... force un rendu frais à chaque lecture (sinon cache)
+            const html = await fffPageHtml(FFF_PAGE_URL + '?v=' + Date.now() + '_' + i);
+            const state = extraireNgState(html);
+            if (!state) continue;
+            for (const cle of Object.keys(state)) {
+                if (!cle.startsWith('analog_GET|') || !cle.includes('/api/data/matches')) continue;
+                const body = state[cle] && state[cle].body;
+                for (const x of (body && body['hydra:member']) || []) {
+                    if (x && x['@id']) parId.set(x['@id'], x);
+                }
+            }
+        } catch (e) { /* on tente la lecture suivante */ }
+    }
+
+    // Page classement : après la 1re journée, son ng-state contiendra le tableau
+    let classement = null;
+    try {
+        const html = await fffPageHtml(FFF_CLASSEMENT_PAGE_URL + '?v=' + Date.now());
+        const state = extraireNgState(html);
+        if (state) {
+            for (const cle of Object.keys(state)) {
+                if (!cle.startsWith('analog_GET|') || !cle.toLowerCase().includes('classement')) continue;
+                const body = state[cle] && state[cle].body;
+                if (body && body['hydra:member'] && body['hydra:member'].length > 0) {
+                    classement = body['hydra:member'];
+                }
+            }
+        }
+    } catch (e) { /* pas bloquant */ }
+
+    return { membres: Array.from(parId.values()), classement: classement };
+}
+
 async function scrapeFFF() {
     const updateData = {};
     const logs = [];
 
-    const session = await fffSession();
-    logs.push('✅ FFF: jeton récupéré' + (session.cookies ? ' (+ cookies)' : ' (sans cookies)'));
+    let membres = [];
+    let classementDePage = null;
+    let session = null;
+    let apiOk = false;
 
-    // Fenêtre : 120 jours en arrière, 120 jours en avant
-    const debut = new Date(Date.now() - 120 * 24 * 3600 * 1000);
-    const fin = new Date(Date.now() + 120 * 24 * 3600 * 1000);
-    const data = await fffApi(session, '/api/data/matches?idEquipe=' + FFF_TEAM_ID
-        + '&dateDebut=' + dateParamFFF(debut) + '&dateFin=' + dateParamFFF(fin)
-        + '&itemsPerPage=100&pagination=true');
+    // 1. API directe (fenêtre large) — souvent bloquée depuis GitHub Actions
+    try {
+        session = await fffSession();
+        const debut = new Date(Date.now() - 120 * 24 * 3600 * 1000);
+        const fin = new Date(Date.now() + 120 * 24 * 3600 * 1000);
+        const data = await fffApi(session, '/api/data/matches?idEquipe=' + FFF_TEAM_ID
+            + '&dateDebut=' + dateParamFFF(debut) + '&dateFin=' + dateParamFFF(fin)
+            + '&itemsPerPage=100&pagination=true');
+        membres = data['hydra:member'] || [];
+        apiOk = true;
+        logs.push('✅ FFF (API directe): ' + membres.length + ' matchs');
+    } catch (e) {
+        logs.push('ℹ️ FFF API directe bloquée (' + String(e.message).slice(0, 60) + '), lecture des pages HTML...');
+    }
 
-    const matchs = (data['hydra:member'] || []).map(mapMatchFFF)
+    // 2. Plan B : les données incluses dans le HTML des pages
+    if (membres.length === 0) {
+        const viaPages = await fffDepuisPages(6);
+        membres = viaPages.membres;
+        classementDePage = viaPages.classement;
+        logs.push('✅ FFF (pages HTML): ' + membres.length + ' matchs fusionnés' + (classementDePage ? ', classement présent' : ''));
+    }
+
+    const matchs = membres.map(mapMatchFFF)
         .filter(function(m) { return m.dateJour; })
         .sort(function(a, b) { return a.date.localeCompare(b.date); });
-    logs.push('✅ FFF: ' + matchs.length + ' matchs sur la période');
-    if (matchs.length === 0) throw new Error('FFF: aucun match renvoyé');
+    if (matchs.length === 0) throw new Error('FFF: aucun match trouvé');
 
     const maintenant = new Date().toISOString();
     const joues = matchs.filter(function(m) { return m.joue; });
@@ -532,7 +612,9 @@ async function scrapeFFF() {
     }
 
     // --- Forme : 5 derniers matchs joués (toutes compétitions) ---
-    if (joues.length > 0) {
+    // En mode "pages HTML" on ne voit que 1-2 mois : si on connaît moins de
+    // 3 matchs joués, on garde la forme déjà en base plutôt que de l'écraser
+    if (joues.length > 0 && (apiOk || joues.length >= 3)) {
         updateData.form = joues.slice(-5).map(function(m) {
             if (m.resuFCMB === 'GA') return 'V';
             if (m.resuFCMB === 'PE') return 'D';
@@ -546,7 +628,8 @@ async function scrapeFFF() {
 
     // --- Stats championnat (matchs R1 joués uniquement) ---
     const matchsR1 = joues.filter(function(m) { return m.competitionType === 'Championnat'; });
-    if (matchsR1.length === 0) {
+    const moisActuel = new Date().getMonth(); // 6=juillet, 7=août, 8=septembre
+    if (matchsR1.length === 0 && moisActuel >= 6 && moisActuel <= 8) {
         // Nouvelle saison, championnat pas commencé : on efface le classement
         // de la saison précédente resté dans Supabase (sinon le site affiche
         // par ex. "6e · 32 pts · 23J" qui date de l'an dernier).
@@ -577,10 +660,20 @@ async function scrapeFFF() {
     // --- Classement complet de la poule ---
     const matchAvecClassement = matchsR1[matchsR1.length - 1]
         || matchs.filter(function(m) { return m.competitionType === 'Championnat'; })[0];
-    if (matchAvecClassement && matchAvecClassement.urlClassement) {
+    let entreesBrutes = null;
+    if (classementDePage) {
+        entreesBrutes = classementDePage;
+    } else if (apiOk && matchAvecClassement && matchAvecClassement.urlClassement) {
         try {
             const cl = await fffApi(session, matchAvecClassement.urlClassement.replace('/api/', '/api/data/'));
-            const entrees = (cl['hydra:member'] || []).map(normaliserEntreeClassement);
+            entreesBrutes = cl['hydra:member'] || [];
+        } catch (e) {
+            logs.push('⚠️ Classement (API): ' + String(e.message).slice(0, 60));
+        }
+    }
+    if (entreesBrutes !== null) {
+        try {
+            const entrees = entreesBrutes.map(normaliserEntreeClassement);
             const valides = entrees.filter(function(e) { return e.position != null && e.points != null && e.team; });
             if (valides.length > 0 && valides.length === entrees.length) {
                 updateData.standings_json = valides;
@@ -598,7 +691,7 @@ async function scrapeFFF() {
                 logs.push('✅ Classement: ' + valides.length + ' équipes' + (fcmb ? ', FCMB ' + fcmb.position + 'e' : ''));
             } else if (entrees.length > 0) {
                 logs.push('⚠️ Classement: champs non reconnus, JSON brut ci-dessous pour ajuster normaliserEntreeClassement()');
-                logs.push(JSON.stringify((cl['hydra:member'] || [])[0]).slice(0, 1500));
+                logs.push(JSON.stringify(entreesBrutes[0]).slice(0, 1500));
             } else {
                 logs.push('ℹ️ Classement pas encore disponible (normal en début de saison)');
             }
