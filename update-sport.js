@@ -328,24 +328,61 @@ function sha1hex(str) {
     return crypto.createHash('sha1').update(str).digest('hex');
 }
 
-// Récupère le jeton ET les cookies de session déposés par la page.
-// Les cookies sont indispensables : sans eux l'API répond 403
-// (dans un navigateur ils sont envoyés automatiquement, ici non).
+function cookiesDe(res) {
+    if (typeof res.headers.getSetCookie === 'function') {
+        return res.headers.getSetCookie().map(c => c.split(';')[0]);
+    }
+    return [];
+}
+
+// Ouvre une session FFF : on lit la page de l'équipe, qui contient
+// 1) l'adresse du point d'accès qui délivre le jeton ("/api/app-security-token/XXXX")
+// 2) un jeton déjà calculé ("VLJAXE":"...") — utilisé en secours
+// On appelle le point d'accès pour obtenir un jeton FRAIS (celui de la page
+// peut être périmé si la page vient d'un cache), plus les cookies éventuels.
 async function fffSession() {
     const res = await fetch(FFF_PAGE_URL, {
-        headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html' }
+        headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
     });
     if (!res.ok) throw new Error('Page FFF: HTTP ' + res.status);
 
-    let cookies = '';
-    if (typeof res.headers.getSetCookie === 'function') {
-        cookies = res.headers.getSetCookie().map(c => c.split(';')[0]).join('; ');
+    let cookies = cookiesDe(res);
+    const html = await res.text();
+
+    const mTok = html.match(/"VLJAXE":"([^"]+)"/);
+    let token = mTok ? mTok[1] : null;
+
+    // Jeton frais via le point d'accès indiqué dans la page
+    const mUrl = html.match(/"url":"(\/api\/app-security-token\/[^"]+)"/);
+    if (mUrl) {
+        try {
+            const rt = await fetch(FFF_SITE + mUrl[1], {
+                headers: {
+                    'User-Agent': USER_AGENT,
+                    'Accept': 'application/json',
+                    'Accept-Language': 'fr-FR,fr;q=0.9',
+                    'Referer': FFF_PAGE_URL,
+                    ...(cookies.length ? { 'Cookie': cookies.join('; ') } : {})
+                }
+            });
+            if (rt.ok) {
+                cookies = cookies.concat(cookiesDe(rt));
+                const jt = await rt.json();
+                if (jt && jt.token) {
+                    token = jt.token;
+                    console.log('  ✅ FFF: jeton frais obtenu via ' + mUrl[1]);
+                }
+            } else {
+                console.log('  ⚠️ FFF: point d\'accès jeton HTTP ' + rt.status + ', on garde le jeton de la page');
+            }
+        } catch (e) {
+            console.log('  ⚠️ FFF: jeton frais impossible (' + e.message + '), on garde celui de la page');
+        }
     }
 
-    const html = await res.text();
-    const m = html.match(/"VLJAXE":"([^"]+)"/);
-    if (!m) throw new Error('Jeton FFF introuvable dans la page');
-    return { token: m[1], cookies: cookies };
+    if (!token) throw new Error('Jeton FFF introuvable');
+    console.log('  ℹ️ FFF: cookies=' + (cookies.length || 'aucun'));
+    return { token: token, cookies: cookies.join('; ') };
 }
 
 async function fffApi(session, path) {
@@ -353,8 +390,12 @@ async function fffApi(session, path) {
     const headers = {
         'User-Agent': USER_AGENT,
         'Accept': 'application/json',
+        'Accept-Language': 'fr-FR,fr;q=0.9',
         'X-Competition': hash,
-        'Referer': FFF_PAGE_URL
+        'Referer': FFF_PAGE_URL,
+        'Sec-Fetch-Dest': 'empty',
+        'Sec-Fetch-Mode': 'cors',
+        'Sec-Fetch-Site': 'same-origin'
     };
     if (session.cookies) headers['Cookie'] = session.cookies;
     const res = await fetch(FFF_SITE + path, { headers: headers });
