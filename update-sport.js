@@ -328,28 +328,40 @@ function sha1hex(str) {
     return crypto.createHash('sha1').update(str).digest('hex');
 }
 
-async function fffToken() {
+// Récupère le jeton ET les cookies de session déposés par la page.
+// Les cookies sont indispensables : sans eux l'API répond 403
+// (dans un navigateur ils sont envoyés automatiquement, ici non).
+async function fffSession() {
     const res = await fetch(FFF_PAGE_URL, {
         headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html' }
     });
     if (!res.ok) throw new Error('Page FFF: HTTP ' + res.status);
+
+    let cookies = '';
+    if (typeof res.headers.getSetCookie === 'function') {
+        cookies = res.headers.getSetCookie().map(c => c.split(';')[0]).join('; ');
+    }
+
     const html = await res.text();
     const m = html.match(/"VLJAXE":"([^"]+)"/);
     if (!m) throw new Error('Jeton FFF introuvable dans la page');
-    return m[1];
+    return { token: m[1], cookies: cookies };
 }
 
-async function fffApi(token, path) {
-    const hash = sha1hex(token + '-' + Math.floor(Date.now() / 10000));
-    const res = await fetch(FFF_SITE + path, {
-        headers: {
-            'User-Agent': USER_AGENT,
-            'Accept': 'application/json',
-            'X-Competition': hash,
-            'Referer': FFF_PAGE_URL
-        }
-    });
-    if (!res.ok) throw new Error('API FFF ' + path.split('?')[0] + ': HTTP ' + res.status);
+async function fffApi(session, path) {
+    const hash = sha1hex(session.token + '-' + Math.floor(Date.now() / 10000));
+    const headers = {
+        'User-Agent': USER_AGENT,
+        'Accept': 'application/json',
+        'X-Competition': hash,
+        'Referer': FFF_PAGE_URL
+    };
+    if (session.cookies) headers['Cookie'] = session.cookies;
+    const res = await fetch(FFF_SITE + path, { headers: headers });
+    if (!res.ok) {
+        const corps = await res.text().catch(function() { return ''; });
+        throw new Error('API FFF ' + path.split('?')[0] + ': HTTP ' + res.status + (corps ? ' — ' + corps.slice(0, 200) : ''));
+    }
     return res.json();
 }
 
@@ -433,13 +445,13 @@ async function scrapeFFF() {
     const updateData = {};
     const logs = [];
 
-    const token = await fffToken();
-    logs.push('✅ FFF: jeton récupéré');
+    const session = await fffSession();
+    logs.push('✅ FFF: jeton récupéré' + (session.cookies ? ' (+ cookies)' : ' (sans cookies)'));
 
     // Fenêtre : 120 jours en arrière, 120 jours en avant
     const debut = new Date(Date.now() - 120 * 24 * 3600 * 1000);
     const fin = new Date(Date.now() + 120 * 24 * 3600 * 1000);
-    const data = await fffApi(token, '/api/data/matches?idEquipe=' + FFF_TEAM_ID
+    const data = await fffApi(session, '/api/data/matches?idEquipe=' + FFF_TEAM_ID
         + '&dateDebut=' + dateParamFFF(debut) + '&dateFin=' + dateParamFFF(fin)
         + '&itemsPerPage=100&pagination=true');
 
@@ -493,6 +505,22 @@ async function scrapeFFF() {
 
     // --- Stats championnat (matchs R1 joués uniquement) ---
     const matchsR1 = joues.filter(function(m) { return m.competitionType === 'Championnat'; });
+    if (matchsR1.length === 0) {
+        // Nouvelle saison, championnat pas commencé : on efface le classement
+        // de la saison précédente resté dans Supabase (sinon le site affiche
+        // par ex. "6e · 32 pts · 23J" qui date de l'an dernier).
+        // Si le classement FFF existe déjà, il est rempli juste en dessous.
+        updateData.standing_position = null;
+        updateData.standings_json = null;
+        updateData.standing_points = null;
+        updateData.standing_played = null;
+        updateData.standing_won = null;
+        updateData.standing_drawn = null;
+        updateData.standing_lost = null;
+        updateData.standing_goals_for = null;
+        updateData.standing_goals_against = null;
+        logs.push('🧹 Championnat pas commencé : classement de la saison précédente effacé');
+    }
     if (matchsR1.length > 0) {
         const stats = computeStats(matchsR1);
         updateData.standing_played = stats.played;
@@ -510,7 +538,7 @@ async function scrapeFFF() {
         || matchs.filter(function(m) { return m.competitionType === 'Championnat'; })[0];
     if (matchAvecClassement && matchAvecClassement.urlClassement) {
         try {
-            const cl = await fffApi(token, matchAvecClassement.urlClassement.replace('/api/', '/api/data/'));
+            const cl = await fffApi(session, matchAvecClassement.urlClassement.replace('/api/', '/api/data/'));
             const entrees = (cl['hydra:member'] || []).map(normaliserEntreeClassement);
             const valides = entrees.filter(function(e) { return e.position != null && e.points != null && e.team; });
             if (valides.length > 0 && valides.length === entrees.length) {
@@ -605,6 +633,23 @@ async function scrapeSportCorico() {
     const allResults = parseChampionnatResults(text);
     logs.push(`📊 ${allResults.length} matchs de championnat R1 trouvés`);
 
+    const mois = new Date().getMonth(); // 6=juillet, 7=août, 8=septembre
+    if (allResults.length === 0 && mois >= 6 && mois <= 8) {
+        // Début de saison : on efface le classement de la saison précédente
+        // (fenêtre limitée à juillet-septembre pour ne pas effacer de vraies
+        // données en cours de saison si le parsing échouait un jour)
+        updateData.standing_position = null;
+        updateData.standings_json = null;
+        updateData.standing_points = null;
+        updateData.standing_played = null;
+        updateData.standing_won = null;
+        updateData.standing_drawn = null;
+        updateData.standing_lost = null;
+        updateData.standing_goals_for = null;
+        updateData.standing_goals_against = null;
+        logs.push('🧹 Intersaison : classement de la saison précédente effacé');
+    }
+
     if (allResults.length > 0) {
         const stats = computeStats(allResults);
         updateData.standing_points = stats.points;
@@ -697,7 +742,7 @@ async function main() {
             } catch (e) {
                 // Si la colonne standings_json n'existe pas encore dans la table,
                 // on réessaie sans elle plutôt que de tout perdre
-                if (updateData.standings_json && /standings_json/i.test(e.message || '')) {
+                if ('standings_json' in updateData && /standings_json/i.test(e.message || '')) {
                     delete updateData.standings_json;
                     const action = await updateSupabase(updateData);
                     logs.push('⚠️ Colonne standings_json absente — mise à jour faite sans le classement complet (' + action + ')');
