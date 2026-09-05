@@ -41,9 +41,9 @@ const FFF_PAGE_URL = FFF_SITE + '/competition/club/' + FFF_CLUB_SLUG + '/equipe/
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
 // La FFF refuse les requêtes venant des serveurs (403, page anti-robot) :
-// ni GitHub ni Vercel ne passent. Le relais reste en place au cas où, mais
-// la source principale est désormais l'API publique de SportCorico.
-const FFF_RELAIS = process.env.FFF_RELAIS_URL || 'https://actuetmedia.fr/api/fff';
+// ni GitHub ni Vercel ne passent. La source principale est donc l'API
+// publique de SportCorico ; la FFF ne sert plus que de secours, et
+// uniquement en lecture directe (depuis un poste normal).
 
 // ============================================
 // API PUBLIQUE SPORTCORICO (source principale)
@@ -699,23 +699,9 @@ function extraireNgState(html) {
     try { return JSON.parse(m[1]); } catch (e) { return null; }
 }
 
-// Demande au relais du site les données d'une page FFF.
-// Renvoie le même objet que le ng-state, filtré aux matchs et au classement.
-async function fffEtatViaRelais(chemin) {
-    const res = await fetch(FFF_RELAIS + '?path=' + encodeURIComponent(chemin), {
-        headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' }
-    });
-    const corps = await res.json().catch(function() { return null; });
-    if (!res.ok || !corps || !corps.state) {
-        const detail = corps && (corps.error || corps.extrait) ? ' — ' + String(corps.error || corps.extrait).slice(0, 80) : '';
-        throw new Error('relais HTTP ' + res.status + detail);
-    }
-    return corps.state;
-}
-
-// Récupère l'état d'une page FFF : lecture directe d'abord (elle marche
-// depuis un poste normal), relais du site ensuite (indispensable depuis
-// GitHub Actions). Renvoie { etat, via }.
+// Récupère l'état d'une page FFF par lecture directe. Cela marche depuis un
+// poste normal ; depuis GitHub Actions la FFF refuse, et on renvoie alors un
+// état vide — l'appelant retombe sur SportCorico. Renvoie { etat, via }.
 async function fffEtatPage(chemin) {
     let diagDirect = '';
     try {
@@ -730,8 +716,7 @@ async function fffEtatPage(chemin) {
         diagDirect = 'erreur réseau: ' + String(e.message).slice(0, 50);
     }
 
-    const etat = await fffEtatViaRelais(chemin);
-    return { etat: etat, via: 'relais', diag: 'direct refusé (' + diagDirect + '), relais OK' };
+    return { etat: null, via: 'direct', diag: 'lecture directe impossible (' + diagDirect + ')' };
 }
 
 function pause(ms) {
@@ -765,6 +750,7 @@ async function fffLirePageEquipe() {
     // sert qu'à tenter l'API (bloquée depuis GitHub). Facultatif donc.
     let token = null;
     let cookies = '';
+    let echec = '';
 
     try {
         const r = await fetch(FFF_SITE + chemin, {
@@ -782,23 +768,13 @@ async function fffLirePageEquipe() {
             console.log('  🌐 ' + diag);
             return { membres: trouve.membres, token: token, cookies: cookies, diag: diag };
         }
-        console.log('  🌐 FFF directe refusée (HTTP ' + r.status + ', ' + Math.round(html.length / 1024) + ' Ko, pas de ng-state) — passage par le relais');
+        echec = 'FFF directe refusée (HTTP ' + r.status + ', ' + Math.round(html.length / 1024) + ' Ko, pas de ng-state)';
     } catch (e) {
-        console.log('  🌐 FFF directe impossible (' + String(e.message).slice(0, 60) + ') — passage par le relais');
+        echec = 'FFF directe impossible (' + String(e.message).slice(0, 60) + ')';
     }
 
-    // Relais du site : c'est la voie qui fonctionne depuis GitHub Actions
-    try {
-        const etat = await fffEtatViaRelais(chemin);
-        const trouve = matchsDuNgState(etat);
-        const diag = 'via le relais du site — ' + trouve.blocs + ' bloc(s), ' + trouve.membres.length + ' match(s)';
-        console.log('  🔁 ' + diag);
-        return { membres: trouve.membres, token: token, cookies: cookies, diag: diag };
-    } catch (e) {
-        const diag = 'relais en échec : ' + String(e.message).slice(0, 120);
-        console.log('  ❌ ' + diag);
-        return { membres: [], token: token, cookies: cookies, diag: diag };
-    }
+    console.log('  ❌ ' + echec);
+    return { membres: [], token: token, cookies: cookies, diag: echec };
 }
 
 // Classement complet : la page publique de la poule
@@ -809,14 +785,14 @@ async function fffClassementDepuisPage(match) {
     const chemin = '/competition/engagement/' + match.competitionSlug
         + '/phase/' + match.phNo + '/' + match.gpNo;
 
-    const res = await fffEtatPage(chemin); // direct, puis relais
+    const res = await fffEtatPage(chemin);
     const state = res.etat;
     if (!state) return null;
     for (const cle of Object.keys(state)) {
         if (!cle.startsWith('analog_GET|') || !cle.toLowerCase().includes('classement')) continue;
         const equipes = equipesDuClassement(state[cle] && state[cle].body);
         if (equipes.length > 0) {
-            console.log('  🏆 Classement lu ' + (res.via === 'relais' ? 'via le relais' : 'en direct') + ' (' + equipes.length + ' équipes)');
+            console.log('  🏆 Classement lu en direct (' + equipes.length + ' équipes)');
             return equipes;
         }
     }
