@@ -3,10 +3,14 @@
 const { createClient } = require('@supabase/supabase-js');
 
 const SUPABASE_URL = process.env.SUPABASE_URL;
-const SUPABASE_KEY = process.env.SUPABASE_ANON_KEY;
+// Ce script tourne dans une GitHub Action, jamais dans un navigateur : il
+// utilise donc la clé service_role, qui ignore les règles RLS. C'est ce qui
+// permet de fermer sport_data au public sans empêcher le scraper d'écrire.
+const SUPABASE_KEY = process.env.SUPABASE_SERVICE_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
 
 if (!SUPABASE_URL || !SUPABASE_KEY) {
-    console.error('❌ Variables SUPABASE_URL et SUPABASE_ANON_KEY requises');
+    console.error('❌ Variables SUPABASE_URL et SUPABASE_SERVICE_KEY requises');
+    console.error('   Ajoutez le secret SUPABASE_SERVICE_KEY dans les réglages du dépôt.');
     process.exit(1);
 }
 
