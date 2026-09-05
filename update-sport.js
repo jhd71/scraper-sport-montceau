@@ -40,10 +40,19 @@ const FFF_PAGE_URL = FFF_SITE + '/competition/club/' + FFF_CLUB_SLUG + '/equipe/
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
-// La FFF refuse les requêtes venant des serveurs de GitHub (403, page
-// anti-robot). Ce relais, hébergé sur le site (Vercel), lit la page à notre
-// place et ne renvoie que les données utiles. Voir api/fff.js du site.
+// La FFF refuse les requêtes venant des serveurs (403, page anti-robot) :
+// ni GitHub ni Vercel ne passent. Le relais reste en place au cas où, mais
+// la source principale est désormais l'API publique de SportCorico.
 const FFF_RELAIS = process.env.FFF_RELAIS_URL || 'https://actuetmedia.fr/api/fff';
+
+// ============================================
+// API PUBLIQUE SPORTCORICO (source principale)
+// Celle qui alimente les widgets que SportCorico propose aux clubs.
+// Elle renvoie du JSON propre, sans clé ni compte, et reste joignable
+// depuis GitHub Actions — contrairement à la FFF.
+// ============================================
+const SC_API = 'https://api.sportcorico.com/api/widgets';
+const SC_TEAM_SLUG = 'montceau-fc-bourgogn'; // identifiant de l'équipe fanion
 
 // ============================================
 // FETCH HTML
@@ -369,6 +378,168 @@ function computeFormFromResults(results) {
         const opp = r.isHome ? r.awayScore : r.homeScore;
         return fcmb > opp ? 'V' : fcmb < opp ? 'D' : 'N';
     }).join(',');
+}
+
+// ============================================
+// SOURCE PRINCIPALE : API WIDGETS SPORTCORICO
+// ============================================
+
+async function scApi(chemin) {
+    const res = await fetch(SC_API + chemin, {
+        headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' }
+    });
+    if (!res.ok) throw new Error('HTTP ' + res.status);
+    const json = await res.json();
+    if (!json || json.success === false) {
+        throw new Error((json && json.message) || 'réponse invalide');
+    }
+    return json;
+}
+
+// "05/09/2026" -> "2026-09-05"
+function dateFR(txt) {
+    const m = String(txt || '').match(/^(\d{2})\/(\d{2})\/(\d{4})$/);
+    return m ? m[3] + '-' + m[2] + '-' + m[1] : null;
+}
+
+// Libellé affiché sur la carte : "Journée 1", "Coupe de France", "Amical"
+function libelleSC(m) {
+    const comp = String(m.championship_name || '').toUpperCase();
+    if (comp.includes('COUPE DE FRANCE')) return 'Coupe de France';
+    if (comp.includes('GAMBARDELLA')) return 'Coupe Gambardella';
+    if (comp.includes('COUPE')) return 'Coupe';
+    if (comp.includes('AMICA')) return 'Amical';
+    return m.day || 'Régional 1'; // "Journée 1" pour le championnat
+}
+
+function equipeSC(nomCourt, slug) {
+    return (slug === SC_TEAM_SLUG) ? 'FC Montceau' : nettoyerNomEquipe(nomCourt || '');
+}
+
+// Parmi les classements renvoyés (l'API donne aussi les saisons passées),
+// retenir celui de la saison EN COURS : une saison terminée a autant de
+// journées jouées que le maximum possible, (nb équipes - 1) x 2.
+function pouleEnCours(pools) {
+    const avecMontceau = (pools || []).filter(function(p) {
+        return (p.lines || []).some(function(l) { return /montceau/i.test(l.team || ''); });
+    });
+    if (avecMontceau.length === 0) return null;
+
+    const enCours = avecMontceau.filter(function(p) {
+        const nb = (p.lines || []).length;
+        const ligne = p.lines.find(function(l) { return /montceau/i.test(l.team || ''); });
+        return ligne && Number(ligne.games_played) < (nb - 1) * 2;
+    });
+
+    const liste = enCours.length > 0 ? enCours : avecMontceau;
+    return liste[liste.length - 1]; // la plus récente
+}
+
+async function scrapeSportCoricoAPI() {
+    console.log('⚽ Lecture de l\'API SportCorico...');
+    const updateData = {};
+    const logs = [];
+
+    // --- Dernier et prochain match ---
+    const matchs = await scApi('/next-previous-team-game/' + SC_TEAM_SLUG);
+
+    const precedent = matchs.previous_match;
+    if (precedent && dateFR(precedent.planned_date)) {
+        const isHome = precedent.home_team_slug === SC_TEAM_SLUG;
+        updateData.last_match_date = dateFR(precedent.planned_date);
+        updateData.last_match_home_team = equipeSC(precedent.home_team_short_name, precedent.home_team_slug);
+        updateData.last_match_away_team = equipeSC(precedent.outside_team_short_name, precedent.outside_team_slug);
+        updateData.last_match_home_score = Number(precedent.home_score) || 0;
+        updateData.last_match_away_score = Number(precedent.outside_score) || 0;
+        updateData.last_match_is_home = isHome;
+        updateData.last_match_matchday = libelleSC(precedent);
+        logs.push('✅ Dernier match: ' + updateData.last_match_home_team + ' '
+            + updateData.last_match_home_score + '-' + updateData.last_match_away_score + ' '
+            + updateData.last_match_away_team + ' (' + updateData.last_match_matchday + ')');
+    } else {
+        logs.push('ℹ️ Aucun match joué renvoyé par l\'API');
+    }
+
+    const suivant = matchs.next_match;
+    if (suivant && dateFR(suivant.planned_date)) {
+        updateData.next_match_date = dateFR(suivant.planned_date);
+        updateData.next_match_time = suivant.planned_time || '';
+        updateData.next_match_home_team = equipeSC(suivant.home_team_short_name, suivant.home_team_slug);
+        updateData.next_match_away_team = equipeSC(suivant.outside_team_short_name, suivant.outside_team_slug);
+        updateData.next_match_is_home = suivant.home_team_slug === SC_TEAM_SLUG;
+        updateData.next_match_matchday = libelleSC(suivant);
+        logs.push('✅ Prochain match: ' + updateData.next_match_home_team + ' vs '
+            + updateData.next_match_away_team + ' le ' + updateData.next_match_date
+            + ' à ' + updateData.next_match_time + ' (' + updateData.next_match_matchday + ')');
+    } else {
+        logs.push('ℹ️ Aucun match à venir renvoyé par l\'API');
+    }
+
+    // --- Classement de la poule ---
+    let poule = null;
+    try {
+        const classements = await scApi('/team-rankings/' + SC_TEAM_SLUG);
+        poule = pouleEnCours(classements.ranking_pools);
+    } catch (e) {
+        logs.push('⚠️ Classement: ' + String(e.message).slice(0, 60));
+    }
+
+    if (poule) {
+        const lignes = (poule.lines || []).map(function(l) {
+            return {
+                position: Number(l.rank),
+                team: nettoyerNomEquipe(l.team || ''),
+                points: Number(l.points),
+                played: Number(l.games_played),
+                won: Number(l.won),
+                drawn: Number(l.nulls),
+                lost: Number(l.lost),
+                goalsFor: Number(l.scored),
+                goalsAgainst: Number(l.conceded),
+                diff: Number(l.difference),
+            };
+        }).filter(function(l) { return l.position && l.team; });
+
+        const fcmb = lignes.find(function(l) { return /montceau/i.test(l.team); });
+
+        if (fcmb && fcmb.played > 0) {
+            updateData.standings_json = lignes;
+            updateData.standing_position = fcmb.position;
+            updateData.standing_points = fcmb.points;
+            updateData.standing_played = fcmb.played;
+            updateData.standing_won = fcmb.won;
+            updateData.standing_drawn = fcmb.drawn;
+            updateData.standing_lost = fcmb.lost;
+            updateData.standing_goals_for = fcmb.goalsFor;
+            updateData.standing_goals_against = fcmb.goalsAgainst;
+            logs.push('🏆 Classement (' + poule.label + '): ' + lignes.length
+                + ' équipes, FCMB ' + fcmb.position + 'e avec ' + fcmb.points + ' pts');
+        } else {
+            // Championnat pas encore commencé : on efface le classement de la
+            // saison précédente resté en base plutôt que d'afficher du périmé
+            updateData.standings_json = null;
+            updateData.standing_position = null;
+            updateData.standing_points = null;
+            updateData.standing_played = null;
+            updateData.standing_won = null;
+            updateData.standing_drawn = null;
+            updateData.standing_lost = null;
+            updateData.standing_goals_for = null;
+            updateData.standing_goals_against = null;
+            logs.push('🧹 Championnat pas encore commencé : ancien classement effacé');
+        }
+
+        // --- Forme : les 5 derniers résultats, fournis par l'API ---
+        const ligneBrute = (poule.lines || []).find(function(l) { return /montceau/i.test(l.team || ''); });
+        const forme = ligneBrute && ligneBrute.shape_of_the_moment;
+        if (Array.isArray(forme) && forme.length > 0) {
+            updateData.form = forme.map(function(f) { return String(f).toUpperCase(); }).join(',');
+            logs.push('✅ Forme: ' + updateData.form);
+        }
+    }
+
+    if (Object.keys(updateData).length === 0) throw new Error('API SportCorico: rien à mettre à jour');
+    return { updateData: updateData, logs: logs };
 }
 
 // ============================================
@@ -993,23 +1164,33 @@ async function updateSupabase(data) {
 async function main() {
     let result = null;
 
-    // 1. Source principale : FFF (epreuves.fff.fr)
+    // 1. Source principale : l'API publique de SportCorico (JSON propre,
+    //    joignable depuis GitHub, donne matchs + classement + forme)
     try {
-        console.log('⚽ Scraping via la FFF (epreuves.fff.fr)...');
-        result = await scrapeFFF();
+        result = await scrapeSportCoricoAPI();
     } catch (err) {
-        console.warn('⚠️ FFF indisponible (' + err.message + '), bascule sur SportCorico...');
-        // Les logs de la tentative FFF sont précieux pour comprendre :
-        // on les affiche au lieu de les perdre
-        (err.logs || []).forEach(l => console.warn('    ' + l));
+        console.warn('⚠️ API SportCorico indisponible (' + err.message + '), essai de la FFF...');
     }
 
-    // 2. Secours : SportCorico (ancien fonctionnement)
+    // 2. Secours : la FFF (fonctionne depuis un poste normal, bloquée depuis
+    //    les serveurs — on tente quand même, au cas où le blocage tomberait)
+    if (!result || Object.keys(result.updateData).length === 0) {
+        try {
+            console.log('⚽ Essai via la FFF (epreuves.fff.fr)...');
+            result = await scrapeFFF();
+        } catch (err) {
+            console.warn('⚠️ FFF indisponible (' + err.message + '), lecture des pages SportCorico...');
+            // Les logs de la tentative sont précieux : on les affiche
+            (err.logs || []).forEach(l => console.warn('    ' + l));
+        }
+    }
+
+    // 3. Dernier secours : lecture des pages HTML de SportCorico
     if (!result || Object.keys(result.updateData).length === 0) {
         try {
             result = await scrapeSportCorico();
         } catch (err) {
-            console.error('❌ SportCorico aussi en échec:', err);
+            console.error('❌ Toutes les sources ont échoué:', err);
             process.exit(1);
         }
     }
