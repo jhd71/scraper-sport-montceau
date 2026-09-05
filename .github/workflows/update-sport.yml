@@ -4,10 +4,14 @@ on:
   schedule:
     # Tous les jours à 7h UTC (9h Paris)
     - cron: '0 7 * * *'
-    # Dimanche à 5h UTC (7h Paris) - résultats du samedi soir
-    - cron: '0 5 * * 0'
-    # Samedi à 22h UTC (minuit Paris) - résultats en soirée
+    # Samedi 19h UTC (21h Paris) - résultats des matchs de fin d'après-midi
+    - cron: '0 19 * * 6'
+    # Samedi 22h UTC (minuit Paris) - résultats en soirée
     - cron: '0 22 * * 6'
+    # Dimanche 17h UTC (19h Paris) - résultats du dimanche après-midi
+    - cron: '0 17 * * 0'
+    # Dimanche 5h UTC (7h Paris) - filet de sécurité du week-end
+    - cron: '0 5 * * 0'
   workflow_dispatch: # Exécution manuelle
 
 jobs:
@@ -15,7 +19,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       TZ: 'Europe/Paris'
-    
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v5
@@ -31,5 +35,5 @@ jobs:
       - name: Run sport scraper
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
-          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: node update-sport.js

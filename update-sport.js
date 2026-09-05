@@ -37,7 +37,6 @@ const FFF_CLUB_SLUG = '500335-f-c-montceau-bourgogne';
 const FFF_TEAM_ID = saisonFFF() + '_432_SEM_1'; // ex: 2026_432_SEM_1
 const FFF_SITE = 'https://epreuves.fff.fr';
 const FFF_PAGE_URL = FFF_SITE + '/competition/club/' + FFF_CLUB_SLUG + '/equipe/' + FFF_TEAM_ID + '/resultat-calendrier';
-const FFF_CLASSEMENT_PAGE_URL = FFF_SITE + '/competition/club/' + FFF_CLUB_SLUG + '/equipe/' + FFF_TEAM_ID + '/classement';
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
@@ -251,6 +250,54 @@ async function parseProchainDepuisPoule() {
 }
 
 // ============================================
+// SECOURS : RÉSULTATS DEPUIS LA PAGE DE LA POULE
+// La fiche club de SportCorico met parfois plusieurs heures à afficher le
+// score (elle montre encore l'heure du coup d'envoi), alors que la page de
+// la poule, elle, est à jour le soir même. On y récupère donc les matchs
+// de Montceau qui ont un score.
+// ============================================
+async function parseResultatsDepuisPoule() {
+    const html = await fetchHTML(POULE_URL);
+    const text = htmlToText(html);
+
+    const aujourdhui = new Intl.DateTimeFormat('fr-CA', {
+        timeZone: 'Europe/Paris', year: 'numeric', month: '2-digit', day: '2-digit'
+    }).format(new Date());
+
+    const resultats = [];
+    // On repère "date score - score" puis on lit les équipes de part et
+    // d'autre avec les mêmes helpers que la fiche club (robustes aux
+    // encarts publicitaires glissés entre les matchs)
+    const noyau = /(\d{2}\/\d{2}\/\d{4})\s+(\d+)\s*-\s*(\d+)/g;
+    let m;
+    while ((m = noyau.exec(text)) !== null) {
+        const avant = text.slice(0, m.index);
+        const apres = text.slice(m.index + m[0].length);
+        const t1 = extraireEquipeFin(avant);
+        const t2 = extraireEquipeDebut(apres);
+        if (!t1 || !t2) continue;
+        if (!t1.toLowerCase().includes('montceau') && !t2.toLowerCase().includes('montceau')) continue;
+
+        const [jour, mois, annee] = m[1].split('/');
+        const date = `${annee}-${mois}-${jour}`;
+        if (date > aujourdhui) continue; // pas un match déjà joué
+
+        const isHome = t1.toLowerCase().includes('montceau');
+        resultats.push({
+            date: date,
+            homeTeam: isHome ? 'FC Montceau' : nettoyerNomEquipe(t1),
+            awayTeam: isHome ? nettoyerNomEquipe(t2) : 'FC Montceau',
+            homeScore: parseInt(m[2]),
+            awayScore: parseInt(m[3]),
+            isHome: isHome,
+        });
+    }
+
+    resultats.sort((a, b) => a.date.localeCompare(b.date));
+    return resultats;
+}
+
+// ============================================
 // PARSER TOUS LES MATCHS DE CHAMPIONNAT
 // ============================================
 function parseChampionnatResults(text) {
@@ -340,56 +387,6 @@ function cookiesDe(res) {
     return [];
 }
 
-// Ouvre une session FFF : on lit la page de l'équipe, qui contient
-// 1) l'adresse du point d'accès qui délivre le jeton ("/api/app-security-token/XXXX")
-// 2) un jeton déjà calculé ("VLJAXE":"...") — utilisé en secours
-// On appelle le point d'accès pour obtenir un jeton FRAIS (celui de la page
-// peut être périmé si la page vient d'un cache), plus les cookies éventuels.
-async function fffSession() {
-    const res = await fetch(FFF_PAGE_URL, {
-        headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
-    });
-    if (!res.ok) throw new Error('Page FFF: HTTP ' + res.status);
-
-    let cookies = cookiesDe(res);
-    const html = await res.text();
-
-    const mTok = html.match(/"VLJAXE":"([^"]+)"/);
-    let token = mTok ? mTok[1] : null;
-
-    // Jeton frais via le point d'accès indiqué dans la page
-    const mUrl = html.match(/"url":"(\/api\/app-security-token\/[^"]+)"/);
-    if (mUrl) {
-        try {
-            const rt = await fetch(FFF_SITE + mUrl[1], {
-                headers: {
-                    'User-Agent': USER_AGENT,
-                    'Accept': 'application/json',
-                    'Accept-Language': 'fr-FR,fr;q=0.9',
-                    'Referer': FFF_PAGE_URL,
-                    ...(cookies.length ? { 'Cookie': cookies.join('; ') } : {})
-                }
-            });
-            if (rt.ok) {
-                cookies = cookies.concat(cookiesDe(rt));
-                const jt = await rt.json();
-                if (jt && jt.token) {
-                    token = jt.token;
-                    console.log('  ✅ FFF: jeton frais obtenu via ' + mUrl[1]);
-                }
-            } else {
-                console.log('  ⚠️ FFF: point d\'accès jeton HTTP ' + rt.status + ', on garde le jeton de la page');
-            }
-        } catch (e) {
-            console.log('  ⚠️ FFF: jeton frais impossible (' + e.message + '), on garde celui de la page');
-        }
-    }
-
-    if (!token) throw new Error('Jeton FFF introuvable');
-    console.log('  ℹ️ FFF: cookies=' + (cookies.length || 'aucun'));
-    return { token: token, cookies: cookies.join('; ') };
-}
-
 async function fffApi(session, path) {
     const hash = sha1hex(session.token + '-' + Math.floor(Date.now() / 10000));
     const headers = {
@@ -411,12 +408,19 @@ async function fffApi(session, path) {
     return res.json();
 }
 
-// "LA CHAPELLE GUINCHAY" -> "La Chapelle Guinchay" ; "DIGOIN F.C.A." garde "F.C.A."
+// La FFF renvoie les noms tout en majuscules. On les remet en forme :
+// "AS CHATENOY LE ROYAL" -> "AS Chatenoy le Royal", "DIGOIN F.C.A." inchangé
+const SIGLES_CLUBS = new Set(['AS', 'ASA', 'ASC', 'AJ', 'AC', 'CA', 'CO', 'CS', 'EA', 'EF',
+    'ES', 'FC', 'FCA', 'FCMB', 'GJ', 'JS', 'OL', 'OM', 'RC', 'SA', 'SC', 'SM', 'UCS', 'UF', 'US']);
+const PETITS_MOTS = new Set(['le', 'la', 'les', 'de', 'du', 'des', 'sur', 'et', 'en', 'aux', 'au', 'sous']);
+
 function joliNom(nom) {
-    return String(nom || '').trim().split(/\s+/).map(function(w) {
-        if (w.includes('.')) return w; // sigle : F.C.A., A.S., etc.
-        if (w.length <= 2) return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
-        return w.charAt(0).toUpperCase() + w.slice(1).toLowerCase();
+    return String(nom || '').trim().split(/\s+/).map(function(mot, i) {
+        if (mot.includes('.')) return mot; // sigle ponctué : F.C.A., Ent.F.
+        if (SIGLES_CLUBS.has(mot.toUpperCase())) return mot.toUpperCase();
+        const bas = mot.toLowerCase();
+        if (i > 0 && PETITS_MOTS.has(bas)) return bas;
+        return bas.charAt(0).toUpperCase() + bas.slice(1);
     }).join(' ');
 }
 
@@ -453,34 +457,50 @@ function mapMatchFFF(x) {
         isHome: isHome,
         resuFCMB: isHome ? (recevant.resu || '') : (visiteur.resu || ''), // GA gagné / PE perdu / NU nul
         urlClassement: (d.groupe && d.groupe.urlClassement) || null,
+        // De quoi reconstruire l'adresse de la page publique du classement :
+        // /competition/engagement/<slug>/phase/<phNo>/<gpNo>
+        competitionSlug: comp.slug || '',
+        phNo: (d.phase && d.phase.phNo) || '',
+        gpNo: (d.groupe && d.groupe.gpNo) || '',
     };
 }
 
-// Le classement n'a pas encore de données cette saison : on ne connaît pas
-// le nom exact des champs. Ce normaliseur essaie les noms probables et,
-// s'il échoue, le JSON brut est affiché dans les logs pour ajuster.
+// Format réel d'une ligne de classement FFF (relevé le 05/09/2026) :
+// { placeAffichage:"2", nomEquipe:"MONTCEAU", classement:"2", points:"3",
+//   nbMatch:"1", nbMatchGagne:"1", nbMatchNul:"0", nbMatchPe:"0",
+//   nbButPour:"3", nbButContre:"1", diffBut:"2", serieEnCours:["V"] }
+// Toutes les valeurs sont des CHAÎNES : d'où le parseInt systématique.
 function normaliserEntreeClassement(e) {
-    const d = e.donneesFormatees || e;
-    const eq = d.equipe || {};
-    const club = eq.club || {};
-    function pick() {
-        for (let i = 0; i < arguments.length; i++) {
-            const v = d[arguments[i]];
-            if (v !== undefined && v !== null && v !== '') return parseInt(v);
-        }
-        return null;
+    function num(v) {
+        const n = parseInt(v, 10);
+        return isNaN(n) ? null : n;
     }
     return {
-        position: pick('place', 'rank', 'rang', 'position'),
-        team: club.nom || club.nomAbr || d.nomEquipe || eq.short_name || '',
-        points: pick('nbPts', 'point_count', 'points', 'pts'),
-        played: pick('nbMatchsJoues', 'total_games_count', 'joues', 'nbMatchs'),
-        won: pick('nbGagnes', 'won_games_count', 'nbMatchsGagnes', 'gagnes'),
-        drawn: pick('nbNuls', 'draw_games_count', 'nbMatchsNuls', 'nuls'),
-        lost: pick('nbPerdus', 'lost_games_count', 'nbMatchsPerdus', 'perdus'),
-        goalsFor: pick('nbButsPour', 'goals_for_count', 'butsPour'),
-        goalsAgainst: pick('nbButsContre', 'goals_against_count', 'butsContre'),
+        position: num(e.placeAffichage != null && e.placeAffichage !== '' ? e.placeAffichage : e.classement),
+        team: e.nomEquipe || e.nomEquipeAbr || '',
+        points: num(e.points),
+        played: num(e.nbMatch),
+        won: num(e.nbMatchGagne),
+        drawn: num(e.nbMatchNul),
+        lost: num(e.nbMatchPe),
+        goalsFor: num(e.nbButPour),
+        goalsAgainst: num(e.nbButContre),
+        diff: num(e.diffBut),
     };
+}
+
+// La réponse "classement" enveloppe le tableau des équipes dans
+// hydra:member[0].donneesFormatees. Cette fonction le déballe, quelle
+// que soit la voie utilisée (page HTML ou API).
+function equipesDuClassement(body) {
+    const out = [];
+    for (const item of (body && body['hydra:member']) || []) {
+        const df = item && item.donneesFormatees;
+        if (Array.isArray(df)) out.push.apply(out, df);
+        else if (df && df.nomEquipe) out.push(df);
+        else if (item && item.nomEquipe) out.push(item);
+    }
+    return out;
 }
 
 function dateParamFFF(d) {
@@ -511,80 +531,135 @@ async function fffPageHtml(url) {
     return res.text();
 }
 
-async function fffDepuisPages(essais) {
-    const parId = new Map();
+function pause(ms) {
+    return new Promise(function(r) { setTimeout(r, ms); });
+}
 
-    for (let i = 0; i < essais; i++) {
+// Extrait tous les matchs présents dans le ng-state d'une page
+function matchsDuNgState(state) {
+    const parId = new Map();
+    let blocs = 0;
+    for (const cle of Object.keys(state || {})) {
+        if (!cle.startsWith('analog_GET|') || !cle.includes('/api/data/matches')) continue;
+        blocs++;
+        const body = state[cle] && state[cle].body;
+        for (const x of (body && body['hydra:member']) || []) {
+            if (x && x['@id']) parId.set(x['@id'], x);
+        }
+    }
+    return { membres: Array.from(parId.values()), blocs: blocs };
+}
+
+// UNE seule lecture de la page de l'équipe suffit : son ng-state contient
+// désormais les matchs de TOUS les mois pré-chargés (clés distinctes par
+// mois), plus le jeton de sécurité. On évite ainsi de marteler le site,
+// ce qui avait probablement déclenché un blocage anti-robot.
+// Deuxième essai (avec anti-cache) seulement si le premier est inexploitable.
+async function fffLirePageEquipe() {
+    let dernierDiag = 'aucune réponse';
+
+    for (let essai = 0; essai < 2; essai++) {
+        const url = (essai === 0) ? FFF_PAGE_URL : FFF_PAGE_URL + '?v=' + Date.now();
         try {
-            // ?v=... force un rendu frais à chaque lecture (sinon cache)
-            const html = await fffPageHtml(FFF_PAGE_URL + '?v=' + Date.now() + '_' + i);
+            if (essai > 0) await pause(3000); // on laisse respirer le site
+            const res = await fetch(url, {
+                headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
+            });
+            const html = await res.text();
             const state = extraireNgState(html);
-            if (!state) continue;
-            for (const cle of Object.keys(state)) {
-                if (!cle.startsWith('analog_GET|') || !cle.includes('/api/data/matches')) continue;
-                const body = state[cle] && state[cle].body;
-                for (const x of (body && body['hydra:member']) || []) {
-                    if (x && x['@id']) parId.set(x['@id'], x);
-                }
+            const mTok = html.match(/"VLJAXE":"([^"]+)"/);
+            const trouve = state ? matchsDuNgState(state) : { membres: [], blocs: 0 };
+
+            dernierDiag = 'HTTP ' + res.status + ', ' + Math.round(html.length / 1024) + ' Ko'
+                + ', ng-state ' + (state ? 'oui' : 'NON')
+                + ', jeton ' + (mTok ? 'oui' : 'NON')
+                + ', ' + trouve.blocs + ' bloc(s), ' + trouve.membres.length + ' match(s)';
+
+            if (trouve.membres.length > 0 || mTok) {
+                console.log('  🌐 FFF page équipe: ' + dernierDiag);
+                return {
+                    membres: trouve.membres,
+                    token: mTok ? mTok[1] : null,
+                    cookies: cookiesDe(res).join('; '),
+                    diag: dernierDiag
+                };
             }
-        } catch (e) { /* on tente la lecture suivante */ }
+            // Page inexploitable : on garde un extrait pour comprendre
+            dernierDiag += ' — extrait: ' + html.replace(/\s+/g, ' ').slice(0, 150);
+        } catch (e) {
+            dernierDiag = 'erreur réseau: ' + e.message;
+        }
     }
 
-    // Page classement : après la 1re journée, son ng-state contiendra le tableau
-    let classement = null;
-    try {
-        const html = await fffPageHtml(FFF_CLASSEMENT_PAGE_URL + '?v=' + Date.now());
-        const state = extraireNgState(html);
-        if (state) {
-            for (const cle of Object.keys(state)) {
-                if (!cle.startsWith('analog_GET|') || !cle.toLowerCase().includes('classement')) continue;
-                const body = state[cle] && state[cle].body;
-                if (body && body['hydra:member'] && body['hydra:member'].length > 0) {
-                    classement = body['hydra:member'];
-                }
-            }
-        }
-    } catch (e) { /* pas bloquant */ }
+    console.log('  🌐 FFF page équipe: ' + dernierDiag);
+    return { membres: [], token: null, cookies: '', diag: dernierDiag };
+}
 
-    return { membres: Array.from(parId.values()), classement: classement };
+// Classement complet : la page publique de la poule
+// (/competition/engagement/<slug>/phase/<phNo>/<gpNo>) inclut le tableau
+// dans son ng-state — donc accessible sans l'API, qui elle est bloquée.
+async function fffClassementDepuisPage(match) {
+    if (!match || !match.competitionSlug || !match.phNo || !match.gpNo) return null;
+    const url = FFF_SITE + '/competition/engagement/' + match.competitionSlug
+        + '/phase/' + match.phNo + '/' + match.gpNo;
+    const html = await fffPageHtml(url);
+    const state = extraireNgState(html);
+    if (!state) return null;
+    for (const cle of Object.keys(state)) {
+        if (!cle.startsWith('analog_GET|') || !cle.toLowerCase().includes('classement')) continue;
+        const equipes = equipesDuClassement(state[cle] && state[cle].body);
+        if (equipes.length > 0) return equipes;
+    }
+    return null;
 }
 
 async function scrapeFFF() {
     const updateData = {};
     const logs = [];
 
-    let membres = [];
-    let classementDePage = null;
-    let session = null;
     let apiOk = false;
 
-    // 1. API directe (fenêtre large) — souvent bloquée depuis GitHub Actions
-    try {
-        session = await fffSession();
-        const debut = new Date(Date.now() - 120 * 24 * 3600 * 1000);
-        const fin = new Date(Date.now() + 120 * 24 * 3600 * 1000);
-        const data = await fffApi(session, '/api/data/matches?idEquipe=' + FFF_TEAM_ID
-            + '&dateDebut=' + dateParamFFF(debut) + '&dateFin=' + dateParamFFF(fin)
-            + '&itemsPerPage=100&pagination=true');
-        membres = data['hydra:member'] || [];
-        apiOk = true;
-        logs.push('✅ FFF (API directe): ' + membres.length + ' matchs');
-    } catch (e) {
-        logs.push('ℹ️ FFF API directe bloquée (' + String(e.message).slice(0, 60) + '), lecture des pages HTML...');
+    // 1. UNE lecture de la page de l'équipe : elle fournit d'un coup les
+    //    matchs (ng-state) ET le jeton de sécurité pour tenter l'API.
+    const page = await fffLirePageEquipe();
+    logs.push('🌐 Page équipe: ' + page.diag);
+    let membres = page.membres;
+
+    // 2. Bonus : si l'API répond (elle est bloquée depuis GitHub Actions),
+    //    elle donne une fenêtre plus large (±120 jours) que la page.
+    if (page.token) {
+        try {
+            const session = { token: page.token, cookies: page.cookies };
+            const debut = new Date(Date.now() - 120 * 24 * 3600 * 1000);
+            const fin = new Date(Date.now() + 120 * 24 * 3600 * 1000);
+            const data = await fffApi(session, '/api/data/matches?idEquipe=' + FFF_TEAM_ID
+                + '&dateDebut=' + dateParamFFF(debut) + '&dateFin=' + dateParamFFF(fin)
+                + '&itemsPerPage=100&pagination=true');
+            const viaApi = data['hydra:member'] || [];
+            if (viaApi.length >= membres.length) {
+                membres = viaApi;
+                apiOk = true;
+                logs.push('✅ FFF (API directe): ' + membres.length + ' matchs');
+            }
+        } catch (e) {
+            logs.push('ℹ️ API FFF indisponible (' + String(e.message).slice(0, 50) + ') — on garde les données de la page');
+        }
     }
 
-    // 2. Plan B : les données incluses dans le HTML des pages
-    if (membres.length === 0) {
-        const viaPages = await fffDepuisPages(6);
-        membres = viaPages.membres;
-        classementDePage = viaPages.classement;
-        logs.push('✅ FFF (pages HTML): ' + membres.length + ' matchs fusionnés' + (classementDePage ? ', classement présent' : ''));
+    if (membres.length > 0 && !apiOk) {
+        logs.push('✅ FFF (page HTML): ' + membres.length + ' matchs');
     }
 
     const matchs = membres.map(mapMatchFFF)
         .filter(function(m) { return m.dateJour; })
         .sort(function(a, b) { return a.date.localeCompare(b.date); });
-    if (matchs.length === 0) throw new Error('FFF: aucun match trouvé');
+    if (matchs.length === 0) {
+        // On attache les logs à l'erreur : sans ça, tout le diagnostic
+        // était perdu et le journal GitHub n'affichait qu'un message vague
+        const err = new Error('FFF: aucun match trouvé');
+        err.logs = logs;
+        throw err;
+    }
 
     const maintenant = new Date().toISOString();
     const joues = matchs.filter(function(m) { return m.joue; });
@@ -616,9 +691,9 @@ async function scrapeFFF() {
     }
 
     // --- Forme : 5 derniers matchs joués (toutes compétitions) ---
-    // En mode "pages HTML" on ne voit que 1-2 mois : si on connaît moins de
-    // 3 matchs joués, on garde la forme déjà en base plutôt que de l'écraser
-    if (joues.length > 0 && (apiOk || joues.length >= 3)) {
+    // La page ne couvre que quelques mois : avec moins de 2 matchs connus
+    // on garde la forme déjà en base plutôt que de l'écraser par une seule lettre
+    if (joues.length > 0 && (apiOk || joues.length >= 2)) {
         updateData.form = joues.slice(-5).map(function(m) {
             if (m.resuFCMB === 'GA') return 'V';
             if (m.resuFCMB === 'PE') return 'D';
@@ -662,17 +737,26 @@ async function scrapeFFF() {
     }
 
     // --- Classement complet de la poule ---
+    // Voie principale : la page publique de la poule, dont le ng-state
+    // contient le tableau complet (l'API, elle, est bloquée depuis GitHub).
     const matchAvecClassement = matchsR1[matchsR1.length - 1]
         || matchs.filter(function(m) { return m.competitionType === 'Championnat'; })[0];
     let entreesBrutes = null;
-    if (classementDePage) {
-        entreesBrutes = classementDePage;
-    } else if (apiOk && matchAvecClassement && matchAvecClassement.urlClassement) {
+    if (matchAvecClassement) {
         try {
-            const cl = await fffApi(session, matchAvecClassement.urlClassement.replace('/api/', '/api/data/'));
-            entreesBrutes = cl['hydra:member'] || [];
+            await pause(1500); // on espace les requêtes vers la FFF
+            entreesBrutes = await fffClassementDepuisPage(matchAvecClassement);
         } catch (e) {
-            logs.push('⚠️ Classement (API): ' + String(e.message).slice(0, 60));
+            logs.push('⚠️ Classement (page poule): ' + String(e.message).slice(0, 60));
+        }
+        if (!entreesBrutes && page.token && matchAvecClassement.urlClassement) {
+            try {
+                const session = { token: page.token, cookies: page.cookies };
+                const cl = await fffApi(session, matchAvecClassement.urlClassement.replace('/api/', '/api/data/'));
+                entreesBrutes = equipesDuClassement(cl);
+            } catch (e) {
+                logs.push('⚠️ Classement (API): ' + String(e.message).slice(0, 50));
+            }
         }
     }
     if (entreesBrutes !== null) {
@@ -695,7 +779,7 @@ async function scrapeFFF() {
                 logs.push('✅ Classement: ' + valides.length + ' équipes' + (fcmb ? ', FCMB ' + fcmb.position + 'e' : ''));
             } else if (entrees.length > 0) {
                 logs.push('⚠️ Classement: champs non reconnus, JSON brut ci-dessous pour ajuster normaliserEntreeClassement()');
-                logs.push(JSON.stringify(entreesBrutes[0]).slice(0, 1500));
+                logs.push(JSON.stringify(entreesBrutes[0]).slice(0, 800));
             } else {
                 logs.push('ℹ️ Classement pas encore disponible (normal en début de saison)');
             }
@@ -737,7 +821,25 @@ async function scrapeSportCorico() {
         updateData.last_match_matchday = lastMatch.competition;
         logs.push(`✅ Dernier match: ${lastMatch.homeTeam} ${lastMatch.homeScore}-${lastMatch.awayScore} ${lastMatch.awayTeam} (${lastMatch.competition || 'compétition inconnue'})`);
     } else {
-        logs.push('⚠️ Dernier match: pas de score');
+        logs.push('⚠️ Dernier match: la fiche club n\'affiche pas encore de score');
+        try {
+            const resultats = await parseResultatsDepuisPoule();
+            if (resultats.length > 0) {
+                const dernier = resultats[resultats.length - 1];
+                updateData.last_match_date = dernier.date;
+                updateData.last_match_home_team = dernier.homeTeam;
+                updateData.last_match_away_team = dernier.awayTeam;
+                updateData.last_match_home_score = dernier.homeScore;
+                updateData.last_match_away_score = dernier.awayScore;
+                updateData.last_match_is_home = dernier.isHome;
+                updateData.last_match_matchday = 'Régional 1';
+                logs.push(`✅ Dernier match (page poule): ${dernier.homeTeam} ${dernier.homeScore}-${dernier.awayScore} ${dernier.awayTeam}`);
+            } else {
+                logs.push('ℹ️ Page poule: aucun résultat de Montceau non plus');
+            }
+        } catch (e) {
+            logs.push('⚠️ Page poule: ' + String(e.message).slice(0, 60));
+        }
     }
 
     if (nextMatch) {
@@ -850,12 +952,15 @@ async function updateSupabase(data) {
 async function main() {
     let result = null;
 
-    // 1. Source principale : API officielle FFF
+    // 1. Source principale : FFF (epreuves.fff.fr)
     try {
-        console.log('⚽ Scraping via API FFF (epreuves.fff.fr)...');
+        console.log('⚽ Scraping via la FFF (epreuves.fff.fr)...');
         result = await scrapeFFF();
     } catch (err) {
         console.warn('⚠️ FFF indisponible (' + err.message + '), bascule sur SportCorico...');
+        // Les logs de la tentative FFF sont précieux pour comprendre :
+        // on les affiche au lieu de les perdre
+        (err.logs || []).forEach(l => console.warn('    ' + l));
     }
 
     // 2. Secours : SportCorico (ancien fonctionnement)
