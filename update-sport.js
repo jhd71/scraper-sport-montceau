@@ -40,6 +40,11 @@ const FFF_PAGE_URL = FFF_SITE + '/competition/club/' + FFF_CLUB_SLUG + '/equipe/
 
 const USER_AGENT = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36';
 
+// La FFF refuse les requêtes venant des serveurs de GitHub (403, page
+// anti-robot). Ce relais, hébergé sur le site (Vercel), lit la page à notre
+// place et ne renvoie que les données utiles. Voir api/fff.js du site.
+const FFF_RELAIS = process.env.FFF_RELAIS_URL || 'https://actuetmedia.fr/api/fff';
+
 // ============================================
 // FETCH HTML
 // ============================================
@@ -523,12 +528,39 @@ function extraireNgState(html) {
     try { return JSON.parse(m[1]); } catch (e) { return null; }
 }
 
-async function fffPageHtml(url) {
-    const res = await fetch(url, {
-        headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
+// Demande au relais du site les données d'une page FFF.
+// Renvoie le même objet que le ng-state, filtré aux matchs et au classement.
+async function fffEtatViaRelais(chemin) {
+    const res = await fetch(FFF_RELAIS + '?path=' + encodeURIComponent(chemin), {
+        headers: { 'User-Agent': USER_AGENT, 'Accept': 'application/json' }
     });
-    if (!res.ok) throw new Error('HTTP ' + res.status);
-    return res.text();
+    const corps = await res.json().catch(function() { return null; });
+    if (!res.ok || !corps || !corps.state) {
+        const detail = corps && (corps.error || corps.extrait) ? ' — ' + String(corps.error || corps.extrait).slice(0, 80) : '';
+        throw new Error('relais HTTP ' + res.status + detail);
+    }
+    return corps.state;
+}
+
+// Récupère l'état d'une page FFF : lecture directe d'abord (elle marche
+// depuis un poste normal), relais du site ensuite (indispensable depuis
+// GitHub Actions). Renvoie { etat, via }.
+async function fffEtatPage(chemin) {
+    let diagDirect = '';
+    try {
+        const res = await fetch(FFF_SITE + chemin, {
+            headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
+        });
+        const html = await res.text();
+        const etat = extraireNgState(html);
+        if (etat) return { etat: etat, via: 'direct', diag: 'HTTP ' + res.status + ', ' + Math.round(html.length / 1024) + ' Ko' };
+        diagDirect = 'HTTP ' + res.status + ', ' + Math.round(html.length / 1024) + ' Ko, ng-state NON';
+    } catch (e) {
+        diagDirect = 'erreur réseau: ' + String(e.message).slice(0, 50);
+    }
+
+    const etat = await fffEtatViaRelais(chemin);
+    return { etat: etat, via: 'relais', diag: 'direct refusé (' + diagDirect + '), relais OK' };
 }
 
 function pause(ms) {
@@ -556,43 +588,46 @@ function matchsDuNgState(state) {
 // ce qui avait probablement déclenché un blocage anti-robot.
 // Deuxième essai (avec anti-cache) seulement si le premier est inexploitable.
 async function fffLirePageEquipe() {
-    let dernierDiag = 'aucune réponse';
+    const chemin = '/competition/club/' + FFF_CLUB_SLUG + '/equipe/' + FFF_TEAM_ID + '/resultat-calendrier';
 
-    for (let essai = 0; essai < 2; essai++) {
-        const url = (essai === 0) ? FFF_PAGE_URL : FFF_PAGE_URL + '?v=' + Date.now();
-        try {
-            if (essai > 0) await pause(3000); // on laisse respirer le site
-            const res = await fetch(url, {
-                headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
-            });
-            const html = await res.text();
-            const state = extraireNgState(html);
-            const mTok = html.match(/"VLJAXE":"([^"]+)"/);
-            const trouve = state ? matchsDuNgState(state) : { membres: [], blocs: 0 };
+    // Jeton de sécurité : seule la lecture directe peut le fournir, et il ne
+    // sert qu'à tenter l'API (bloquée depuis GitHub). Facultatif donc.
+    let token = null;
+    let cookies = '';
 
-            dernierDiag = 'HTTP ' + res.status + ', ' + Math.round(html.length / 1024) + ' Ko'
-                + ', ng-state ' + (state ? 'oui' : 'NON')
-                + ', jeton ' + (mTok ? 'oui' : 'NON')
-                + ', ' + trouve.blocs + ' bloc(s), ' + trouve.membres.length + ' match(s)';
+    try {
+        const r = await fetch(FFF_SITE + chemin, {
+            headers: { 'User-Agent': USER_AGENT, 'Accept': 'text/html', 'Accept-Language': 'fr-FR,fr;q=0.9' }
+        });
+        const html = await r.text();
+        const etat = extraireNgState(html);
+        const mTok = html.match(/"VLJAXE":"([^"]+)"/);
+        if (mTok) { token = mTok[1]; cookies = cookiesDe(r).join('; '); }
 
-            if (trouve.membres.length > 0 || mTok) {
-                console.log('  🌐 FFF page équipe: ' + dernierDiag);
-                return {
-                    membres: trouve.membres,
-                    token: mTok ? mTok[1] : null,
-                    cookies: cookiesDe(res).join('; '),
-                    diag: dernierDiag
-                };
-            }
-            // Page inexploitable : on garde un extrait pour comprendre
-            dernierDiag += ' — extrait: ' + html.replace(/\s+/g, ' ').slice(0, 150);
-        } catch (e) {
-            dernierDiag = 'erreur réseau: ' + e.message;
+        if (etat) {
+            const trouve = matchsDuNgState(etat);
+            const diag = 'lecture directe — HTTP ' + r.status + ', ' + Math.round(html.length / 1024) + ' Ko, '
+                + trouve.blocs + ' bloc(s), ' + trouve.membres.length + ' match(s)';
+            console.log('  🌐 ' + diag);
+            return { membres: trouve.membres, token: token, cookies: cookies, diag: diag };
         }
+        console.log('  🌐 FFF directe refusée (HTTP ' + r.status + ', ' + Math.round(html.length / 1024) + ' Ko, pas de ng-state) — passage par le relais');
+    } catch (e) {
+        console.log('  🌐 FFF directe impossible (' + String(e.message).slice(0, 60) + ') — passage par le relais');
     }
 
-    console.log('  🌐 FFF page équipe: ' + dernierDiag);
-    return { membres: [], token: null, cookies: '', diag: dernierDiag };
+    // Relais du site : c'est la voie qui fonctionne depuis GitHub Actions
+    try {
+        const etat = await fffEtatViaRelais(chemin);
+        const trouve = matchsDuNgState(etat);
+        const diag = 'via le relais du site — ' + trouve.blocs + ' bloc(s), ' + trouve.membres.length + ' match(s)';
+        console.log('  🔁 ' + diag);
+        return { membres: trouve.membres, token: token, cookies: cookies, diag: diag };
+    } catch (e) {
+        const diag = 'relais en échec : ' + String(e.message).slice(0, 120);
+        console.log('  ❌ ' + diag);
+        return { membres: [], token: token, cookies: cookies, diag: diag };
+    }
 }
 
 // Classement complet : la page publique de la poule
@@ -600,15 +635,19 @@ async function fffLirePageEquipe() {
 // dans son ng-state — donc accessible sans l'API, qui elle est bloquée.
 async function fffClassementDepuisPage(match) {
     if (!match || !match.competitionSlug || !match.phNo || !match.gpNo) return null;
-    const url = FFF_SITE + '/competition/engagement/' + match.competitionSlug
+    const chemin = '/competition/engagement/' + match.competitionSlug
         + '/phase/' + match.phNo + '/' + match.gpNo;
-    const html = await fffPageHtml(url);
-    const state = extraireNgState(html);
+
+    const res = await fffEtatPage(chemin); // direct, puis relais
+    const state = res.etat;
     if (!state) return null;
     for (const cle of Object.keys(state)) {
         if (!cle.startsWith('analog_GET|') || !cle.toLowerCase().includes('classement')) continue;
         const equipes = equipesDuClassement(state[cle] && state[cle].body);
-        if (equipes.length > 0) return equipes;
+        if (equipes.length > 0) {
+            console.log('  🏆 Classement lu ' + (res.via === 'relais' ? 'via le relais' : 'en direct') + ' (' + equipes.length + ' équipes)');
+            return equipes;
+        }
     }
     return null;
 }
@@ -739,8 +778,10 @@ async function scrapeFFF() {
     // --- Classement complet de la poule ---
     // Voie principale : la page publique de la poule, dont le ng-state
     // contient le tableau complet (l'API, elle, est bloquée depuis GitHub).
-    const matchAvecClassement = matchsR1[matchsR1.length - 1]
-        || matchs.filter(function(m) { return m.competitionType === 'Championnat'; })[0];
+    // N'importe quel match de championnat suffit : on n'a besoin que de son
+    // identifiant de poule pour construire l'adresse de la page classement
+    const matchsChampionnat = matchs.filter(function(m) { return m.competitionType === 'Championnat'; });
+    const matchAvecClassement = matchsR1[matchsR1.length - 1] || matchsChampionnat[0];
     let entreesBrutes = null;
     if (matchAvecClassement) {
         try {
