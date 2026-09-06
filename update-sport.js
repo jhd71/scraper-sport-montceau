@@ -1114,14 +1114,28 @@ async function scrapeSportCorico() {
 // MISE À JOUR SUPABASE
 // ============================================
 async function updateSupabase(data) {
+    // La table contient maintenant une ligne par équipe (foot, basket_m,
+    // basket_f) : ce script ne doit toucher QUE la ligne du foot, sinon il
+    // écraserait une ligne basket.
     const { data: existing } = await supabase
         .from('sport_data')
         .select('id')
-        .order('updated_at', { ascending: false })
+        .eq('team_key', 'foot')
         .limit(1)
-        .single();
+        .maybeSingle();
 
-    const payload = { ...data, updated_at: new Date().toISOString(), updated_by: 'github-actions' };
+    const payload = {
+        ...data,
+        team_key: 'foot',
+        team_label: 'FC Montceau',
+        competition_label: 'R1 Herbelin',
+        sport: 'foot',
+        source_name: 'SportCorico',
+        source_url: SPORTCORICO_URL,
+        display_order: 1,
+        updated_at: new Date().toISOString(),
+        updated_by: 'github-actions'
+    };
 
     if (existing) {
         const { error } = await supabase.from('sport_data').update(payload).eq('id', existing.id);
