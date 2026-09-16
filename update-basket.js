@@ -31,16 +31,18 @@ const EQUIPES = [
     {
         key: 'basket_m',
         teamId: 70969,
-        label: 'BMB Masculins',
-        nomCourt: 'BMB',
+        // Le nom porte la ville, comme « FC Montceau » côté foot : un lecteur
+        // de passage doit comprendre sans connaître le sigle BMB
+        label: 'Basket Montceau',
+        nomCourt: 'Montceau',
         ordre: 2,
         url: SITE + '/basket/clubs/basket-montceau-bourgogne-2m56/1-1ird'
     },
     {
         key: 'basket_f',
         teamId: 124456,
-        label: 'BMB Féminines',
-        nomCourt: 'BMB',
+        label: 'Basket Montceau',
+        nomCourt: 'Montceau',
         ordre: 3,
         url: SITE + '/basket/clubs/basket-montceau-bourgogne-2m56/1-feminine-2o14'
     }
@@ -146,8 +148,8 @@ function libelleJournee(round) {
     return round.name || null;
 }
 
-// Nom d'équipe pour l'affichage : le BMB garde son sigle, les autres
-// gardent le nom de leur club.
+// Nom d'équipe pour l'affichage : notre club est affiché « Montceau »
+// (clair pour tout le monde), les autres gardent le nom de leur club.
 function nomEquipe(pt, nomCourtBMB) {
     const club = pt && pt.team_in_season && pt.team_in_season.team && pt.team_in_season.team.club;
     if (!club) return '?';
