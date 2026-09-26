@@ -444,23 +444,47 @@ async function scrapeSportCoricoAPI() {
     const matchs = await scApi('/next-previous-team-game/' + SC_TEAM_SLUG);
 
     const precedent = matchs.previous_match;
-    if (precedent && dateFR(precedent.planned_date)) {
+
+    // SportCorico range un match dans "previous_match" dès l'heure du coup
+    // d'envoi, mais avec home_score / outside_score à null tant que le
+    // résultat n'est pas saisi (status "À venir"). Avant ce correctif, null
+    // devenait 0 et le site affichait un faux 0-0 (constaté le 26/09/2026
+    // sur Montceau–Decize, gagné 1-0 en réalité).
+    const scoreConnu = function(v) { return v !== null && v !== undefined && v !== ''; };
+    const aUnScore = !!precedent && scoreConnu(precedent.home_score) && scoreConnu(precedent.outside_score);
+
+    // Match commencé mais sans résultat : on ne touche pas au dernier match
+    // en base, et on le garde affiché comme "prochain" pendant 3 jours au
+    // plus (le site affiche alors "Ce soir !" puis "Résultat en attente"),
+    // comme pour le basket.
+    let enAttente = null;
+    if (precedent && dateFR(precedent.planned_date) && !aUnScore) {
+        const limite = new Date(Date.now() - 3 * 24 * 3600 * 1000)
+            .toLocaleDateString('sv-SE', { timeZone: 'Europe/Paris' });
+        if (dateFR(precedent.planned_date) >= limite) enAttente = precedent;
+        logs.push('⏳ Résultat pas encore saisi : '
+            + equipeSC(precedent.home_team_short_name, precedent.home_team_slug) + ' vs '
+            + equipeSC(precedent.outside_team_short_name, precedent.outside_team_slug)
+            + ' du ' + dateFR(precedent.planned_date) + ' — dernier match en base conservé');
+    }
+
+    if (precedent && dateFR(precedent.planned_date) && aUnScore) {
         const isHome = precedent.home_team_slug === SC_TEAM_SLUG;
         updateData.last_match_date = dateFR(precedent.planned_date);
         updateData.last_match_home_team = equipeSC(precedent.home_team_short_name, precedent.home_team_slug);
         updateData.last_match_away_team = equipeSC(precedent.outside_team_short_name, precedent.outside_team_slug);
-        updateData.last_match_home_score = Number(precedent.home_score) || 0;
-        updateData.last_match_away_score = Number(precedent.outside_score) || 0;
+        updateData.last_match_home_score = Number(precedent.home_score);
+        updateData.last_match_away_score = Number(precedent.outside_score);
         updateData.last_match_is_home = isHome;
         updateData.last_match_matchday = libelleSC(precedent);
         logs.push('✅ Dernier match: ' + updateData.last_match_home_team + ' '
             + updateData.last_match_home_score + '-' + updateData.last_match_away_score + ' '
             + updateData.last_match_away_team + ' (' + updateData.last_match_matchday + ')');
-    } else {
+    } else if (!enAttente && !precedent) {
         logs.push('ℹ️ Aucun match joué renvoyé par l\'API');
     }
 
-    const suivant = matchs.next_match;
+    const suivant = enAttente || matchs.next_match;
     if (suivant && dateFR(suivant.planned_date)) {
         updateData.next_match_date = dateFR(suivant.planned_date);
         updateData.next_match_time = suivant.planned_time || '';
