@@ -244,11 +244,24 @@ function construire(equipe, brut, classement) {
     }
 
     // --- PROCHAIN MATCH ---
+    // Score'n'co fait passer un match de next_events à last_events dès le
+    // coup d'envoi, avec un score vide tant que la feuille de match n'est
+    // pas remontée. Sans précaution, le bloc sautait à la journée suivante
+    // pendant que le match se jouait encore. On garde donc comme "prochain"
+    // un match déjà commencé mais sans résultat, pendant 3 jours au plus
+    // (au-delà, on considère que le score ne viendra pas).
     const jour = aujourdhuiParis();
+    const limite = new Date(Date.now() - 3 * 24 * 3600 * 1000)
+        .toLocaleDateString('sv-SE', { timeZone: 'Europe/Paris' });
+
+    const enAttente = (brut.last_events || [])
+        .filter(ev => !estJoue(ev) && (dateParis(ev.time, ev.date) || '') >= limite);
+
     const aVenir = (brut.next_events || [])
-        .filter(ev => (dateParis(ev.time, ev.date) || '') >= jour && ev.status !== 'finish')
-        .sort((a, b) => (a.time || a.date).localeCompare(b.time || b.date));
-    const prochain = aVenir[0];
+        .filter(ev => (dateParis(ev.time, ev.date) || '') >= jour && ev.status !== 'finish');
+
+    const prochain = [...enAttente, ...aVenir]
+        .sort((a, b) => (a.time || a.date).localeCompare(b.time || b.date))[0];
 
     if (prochain) {
         const dom = prochain.playing_teams.find(p => p.role === 'home');
