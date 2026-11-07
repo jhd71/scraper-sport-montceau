@@ -2,16 +2,31 @@ name: Update FC Montceau Sport Data
 
 on:
   schedule:
-    # Tous les jours à 7h UTC (9h Paris)
-    - cron: '0 7 * * *'
-    # Samedi 19h UTC (21h Paris) - résultats des matchs de fin d'après-midi
-    - cron: '0 19 * * 6'
-    # Samedi 22h UTC (minuit Paris) - résultats en soirée
-    - cron: '0 22 * * 6'
-    # Dimanche 17h UTC (19h Paris) - résultats du dimanche après-midi
-    - cron: '0 17 * * 0'
-    # Dimanche 5h UTC (7h Paris) - filet de sécurité du week-end
-    - cron: '0 5 * * 0'
+    # ATTENTION : heures en UTC. Paris = UTC+1 en hiver, UTC+2 en été.
+    # Chaque passage lance le foot ET le basket.
+
+    # Tous les jours : 8h27 Paris (hiver) / 9h27 (été)
+    - cron: '27 7 * * *'
+
+    # SAMEDI
+    # 20h27 Paris (hiver) / 21h27 (été) - foot de 18h
+    - cron: '27 19 * * 6'
+    # 21h27 Paris (hiver) / 22h27 (été) - foot si score en retard
+    - cron: '27 20 * * 6'
+    # 22h47 Paris (hiver) / 23h47 (été) - basket masculin de 20h
+    - cron: '47 21 * * 6'
+    # 23h47 Paris (hiver) / 0h47 (été) - basket si feuille de match en retard
+    - cron: '47 22 * * 6'
+
+    # DIMANCHE
+    # 6h17 Paris (hiver) / 7h17 (été) - filet de sécurité du samedi
+    - cron: '17 5 * * 0'
+    # 17h27 Paris (hiver) / 18h27 (été) - foot de 15h
+    - cron: '27 16 * * 0'
+    # 18h27 Paris (hiver) / 19h27 (été) - basket de l'après-midi
+    - cron: '27 17 * * 0'
+    # 19h47 Paris (hiver) / 20h47 (été) - si score en retard
+    - cron: '47 18 * * 0'
   workflow_dispatch: # Exécution manuelle
 
 jobs:
